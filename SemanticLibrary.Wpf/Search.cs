@@ -48,7 +48,7 @@ namespace AILibrary
                         $"--model_name {quotedModel} " +
                         $"--db {quotedDb} " +
                         $"--index {quotedIndex}" +
-                        $"--literal {semanticSearch}",
+                        (semanticSearch ? "" : "--semantic"),
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,

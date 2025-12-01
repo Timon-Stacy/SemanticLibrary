@@ -120,6 +120,7 @@ namespace SemanticLibrary.Wpf
         {
             SearchProgressBar.Visibility = Visibility.Visible;
             _query = SearchTextBox.Text;
+            _semanticSearch = SemanticSearchCheckBox.IsChecked == true;
             AISearch();
         }
 
@@ -232,11 +233,6 @@ namespace SemanticLibrary.Wpf
                 var table = Utilities.LoadData(_databasePath);
                 LibraryDataGrid.ItemsSource = table?.DefaultView;
             }
-        }
-
-        private void SemanticSearchCheckBox_Checked(object sender, RoutedEventArgs e)
-        {
-            _semanticSearch = SemanticSearchCheckBox.IsChecked == true;
         }
     }
 }
