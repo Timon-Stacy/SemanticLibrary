@@ -30,7 +30,8 @@ namespace AILibrary
                 Debug.WriteLine($"Search params: k={k}, minCos={minCos}, fetchK={fetchK}, model={model}");
 
                 // naive quoting; good enough for normal use
-                string quotedQuery = $"\"{query}\"";
+                string escapedQuery = query.Replace("\"", "\\\"");
+                string quotedQuery = $"\"{escapedQuery}\"";
                 string quotedModel = $"\"{model}\"";
                 string quotedDb = $"\"{db}\"";
                 string quotedIndex = $"\"{index}\"";
@@ -68,6 +69,7 @@ namespace AILibrary
                         if (!string.IsNullOrWhiteSpace(error))
                         {
                             Debug.WriteLine("Python stderr:\n" + error);
+                            MessageBox.Show($"Python Debug Output:\n\n{error}", "Debug");
                         }
 
                         if (process.ExitCode != 0)
