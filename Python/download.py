@@ -1,75 +1,240 @@
-import sqlite3
-import requests
+﻿import sqlite3
+import logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger("library")
 import time
 from urllib.parse import quote
 from io import BytesIO
-from pdfminer.high_level import extract_text
 import subprocess
 import sys, json
-import functools, builtins
 import re
 import shutil
 import argparse
-print = functools.partial(builtins.print, flush=True)
+import requests
+
+from pdfminer.high_level import extract_text
 
 DB_PATH_DEFAULT = "library.db"
 
-headers = {"User-Agent": "MVP-Library/0.1 (+no email)"}
+SESSION = None
 
-def download_gutenberg_text(gid: int):
-    gutenberg_url_templates = [
-    f"https://www.gutenberg.org/files/{gid}/{gid}-0.txt",
-    f"https://www.gutenberg.org/files/{gid}/{gid}.txt",
-    f"https://www.gutenberg.org/ebooks/{gid}.txt.utf-8",
-]
-    
-    for url in gutenberg_url_templates:
-        try:
-            attempt = requests.get(url, timeout=20, headers=headers)
-            if attempt.status_code == 200 and attempt.text.strip():
-                return attempt.text, url
-        except requests.RequestException:
-            pass
-    return None, None
 
-def download_ia_text(ia_id: str):
-    ia_url_template = [
-    f"https://archive.org/download/{ia_id}/{ia_id}_djvu.txt",
-    f"https://archive.org/download/{ia_id}/{ia_id}.txt",
-]  
-    for url in ia_url_template:
-        try:
-            attempt = requests.get(url, timeout=20, headers=headers)
-            if attempt.status_code == 200 and attempt.text.strip():
-                return attempt.text, url
-        except requests.RequestException:
-            pass
-    return None, None
+def check_dependencies():
+    """Check for required and optional dependencies at startup."""
+    global SESSION
 
-def extract_text_from_pdf(gb_pdf):
+    missing_required = []
+    missing_optional = []
+
+    # Check required Python packages
     try:
-        text = extract_text(BytesIO(gb_pdf.content))
+        from pdfminer.high_level import extract_text
+    except ImportError:
+        missing_required.append("pdfminer.six (pip install pdfminer.six)")
+
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        SESSION = requests.Session()
+        retry = Retry(
+            total=5,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        SESSION.mount("https://", HTTPAdapter(max_retries=retry))
+        SESSION.headers.update({"User-Agent": "MVP-Library/0.1 (+no email)"})
+    except ImportError:
+        missing_required.append("requests (pip install requests)")
+
+    # Optional OCR deps
+    if shutil.which("tesseract") is None:
+        missing_optional.append("tesseract (OCR will be unavailable)")
+
+    if shutil.which("gswin64c") is None and shutil.which("gs") is None:
+        missing_optional.append("ghostscript (OCR will be unavailable)")
+
+    try:
+        import ocrmypdf
+    except ImportError:
+        missing_optional.append("ocrmypdf (pip install ocrmypdf - OCR will be unavailable)")
+
+    if missing_required:
+        log.error("Missing required dependencies:")
+        for dep in missing_required:
+            log.error("  - %s", dep)
+        sys.exit(1)
+
+    if missing_optional:
+        log.warning("Missing optional dependencies:")
+        for dep in missing_optional:
+            log.warning("  - %s", dep)
+        log.warning("PDF text extraction will work, but OCR fallback will be unavailable.")
+
+
+class Downloaders:
+    domain = None
+    name = None
+    headers = {"User-Agent": "MVP-Library/0.1 (+no email)"}
+
+    def get_id(self, url: str):
+        raise NotImplementedError
+
+    def download(self):
+        raise NotImplementedError
+
+    def _download_text(self, urls: list[str]):
+        for url in urls:
+            try:
+                r = SESSION.get(url, timeout=20, headers=self.headers)
+                if r.status_code == 200:
+                    return r, url
+            except Exception as e:
+                log.warning("Failed to fetch %s: %s", url, e)
+        return None, None
+
+    def _get_json(self, url: str):
+        try:
+            r = SESSION.get(url, timeout=20, headers=self.headers)
+            if r.status_code == 200:
+                return r.json(), url
+        except Exception as e:
+            log.warning("Failed to fetch JSON %s: %s", url, e)
+        return None, None
+
+    @classmethod
+    def match_downloader(cls, classes: list, url: str):
+        for downloader in classes:
+            if downloader.domain in url:
+                return downloader()
+        return None
+
+
+class GutenbergDownloader(Downloaders):
+    domain = "gutenberg.org"
+    name = "gutenberg_id"
+
+    def __init__(self):
+        self.id = None
+        self.book = None
+
+    def get_id(self, url: str):
+        if "/ebooks/" not in url:
+            return None
+        try:
+            self.id = int(url.split("/ebooks/")[1].split("?")[0])
+        except ValueError:
+            return None
+        return self.id
+
+    def download(self):
+        if self.id is None:
+            return None, None
+
+        urls = [
+            f"https://www.gutenberg.org/files/{self.id}/{self.id}-0.txt",
+            f"https://www.gutenberg.org/files/{self.id}/{self.id}.txt",
+            f"https://www.gutenberg.org/ebooks/{self.id}.txt.utf-8",
+        ]
+        r, url = self._download_text(urls)
+        if r and r.text.strip():
+            return r.text, url
+        return None, None
+
+
+class InternetArchiveDownloader(Downloaders):
+    domain = "archive.org"
+    name = "ia_title_id"
+
+    def __init__(self):
+        self.id = None
+        self.book = None
+
+    def get_id(self, url: str):
+        if "/details/" not in url:
+            return None
+        self.id = url.split("/details/")[1].split("/")[0]
+        return self.id
+
+    def download(self):
+        if self.id is None:
+            return None, None
+
+        urls = [
+            f"https://archive.org/download/{self.id}/{self.id}_djvu.txt",
+            f"https://archive.org/download/{self.id}/{self.id}.txt",
+        ]
+        r, url = self._download_text(urls)
+        if r and r.text.strip():
+            return r.text, url
+        return None, None
+
+
+class GoogleBooksDownloader(Downloaders):
+    domain = "books.google."
+    name = "gb_title_id"
+
+    def __init__(self):
+        self.id = None
+        self.book = None
+
+    def get_id(self, url: str):
+        patterns = [
+            r"/books/edition/[^/]+/([^?\/]+)",
+            r"\bid=([^&]+)",
+            r"/books\?id=([^&]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                self.id = match.group(1)
+                return self.id
+        return None
+
+    def download(self):
+        if self.id is None:
+            return None, None
+
+        url = f"https://www.googleapis.com/books/v1/volumes/{self.id}"
+        if api_key:
+            url += f"?key={quote(api_key)}"
+
+        meta, _ = self._get_json(url)
+        if not meta:
+            return None, None
+        return extract_pdf(meta)
+
+DOWNLOADERS = [GutenbergDownloader, InternetArchiveDownloader, GoogleBooksDownloader]
+
+# PDF text extraction functions
+
+def extract_text_from_pdf(pdf):
+    try:
+        text = extract_text(BytesIO(pdf.content))
         if text and text.strip():
             return text
-    except Exception as e:
-        print(f"pdfminer failed: {e}")
+    except Exception:
+        log.exception("pdfminer failed")
 
     return None
 
-def extract_ocr_from_pdf(gb_pdf):
+def extract_ocr_from_pdf(pdf):
     if shutil.which("tesseract") is None:
-        print("Tesseract not found - skipping OCR")
+        log.info("Tesseract not found — skipping OCR")
         return None
 
-    if shutil.which("gswin64c") is None:
-        print("Ghostscript not found - skipping OCR")
+    # Check for ghostscript
+    gs_cmd = shutil.which("gswin64c") or shutil.which("gs")
+    if gs_cmd is None:
+        log.info("Ghostscript not found — skipping OCR")
         return None
     
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "ocrmypdf",
              "--skip-text", "--force-ocr", "-l", "eng", "-", "-"],
-            input=gb_pdf.content,
+            input=pdf.content,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,   # capture stderr for debugging
             check=True,
@@ -78,219 +243,155 @@ def extract_ocr_from_pdf(gb_pdf):
         if text and text.strip():
             return text
         else:
-            print("OCR produced no text.")
-    except Exception as e:
-        print(f"OCR failed: {e}")
+            log.warning("OCR produced no text")
+    except Exception:
+        log.exception("OCR failed")
     return None
 
-def convert_pdf_to_text(gb_pdf):
+def convert_pdf_to_text(pdf):
 
-    text = extract_text_from_pdf(gb_pdf)
+    text = extract_text_from_pdf(pdf)
     if text is not None:
         return text
     else:
-        return extract_ocr_from_pdf(gb_pdf)
+        return extract_ocr_from_pdf(pdf)
 
-def extract_gb_pdf(meta):
+def extract_pdf(meta):
     book_meta = (meta.get("accessInfo") or {}).get("pdf") or {}
     if not book_meta.get("isAvailable"):
-        print("No downloadable PDF for this volume.")
+        log.info("No downloadable PDF for this volume")
         return None, None
 
     download_url = book_meta.get("downloadLink")
     if not download_url:
-        print("PDF isAvailable but no downloadLink.")
+        log.warning("PDF marked available but no downloadLink present")
         return None, None
     
     try:
-        gb_pdf = requests.get(download_url, timeout=60, headers=headers)
-        print(f"PDF status {gb_pdf.status_code}, length {len(gb_pdf.content)} bytes")
+        pdf = SESSION.get(download_url, timeout=60, headers=Downloaders.headers)
+        log.info("Google PDF status=%s size=%s bytes", pdf.status_code, len(pdf.content))
 
-        # Heuristic: tiny PDFs are usually error/captcha pages
-        if gb_pdf.status_code != 200 or len(gb_pdf.content) < 50000:
-            print("Likely CAPTCHA or error page from Google - skipping.")
+        # Tiny PDFs are usually error/captcha pages
+        if pdf.status_code != 200 or len(pdf.content) < 50000:
+            log.warning("Likely CAPTCHA or error page from Google — skipping")
             return None, None
-    except requests.RequestException as e:
-        print(f"PDF download error: {e}")
+    except requests.RequestException:
+        log.exception("PDF download error")
         return None, None
     
-    return convert_pdf_to_text(gb_pdf), download_url
+    return convert_pdf_to_text(pdf), download_url
 
-def download_gb_text(gb_id: str, api_key: str | None = None):
-    url = f"https://www.googleapis.com/books/v1/volumes/{gb_id}"
-    params = {"projection": "full"}
-    if api_key:
-        params["key"] = api_key
 
+def store_in_db(downloader: Downloaders, connection, cursor):
+    title_id, user_title, author, category = downloader.book
+    log.info("Downloading %s (%s)", title_id, downloader.domain)
+    text, url = downloader.download()
+    if text:
+        cursor.execute(f"""
+            INSERT INTO books ({downloader.name}, author, title, category, source_url, content)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT({downloader.name}) DO UPDATE SET
+              title=excluded.title,
+              category=excluded.category,
+              source_url=excluded.source_url,
+              content=excluded.content,
+              author=excluded.author
+        """, (title_id, author, user_title, category, url, text))
+        connection.commit()
+        log.info("Stored %s successfully", title_id)
+    else:
+        log.warning("Failed to store %s", title_id)
+
+def process_input(data, connection, cursor):
+    total = len(data)
+    for idx, item in enumerate(data, 1):
+        lower = {k.lower(): v for k, v in item.items()}
+
+        url = lower.get("url")
+        book_title = lower.get("title")
+        author   = lower.get("author") or "Unknown"
+        category = lower.get("category") or "Uncategorized"
+
+        if not url or not book_title:
+            continue
+
+        downloader = Downloaders.match_downloader(DOWNLOADERS, url)
+        if downloader is None:
+            continue
+        source_id = downloader.get_id(url)
+        if source_id is None:
+            continue;
+
+        cursor.execute(f"SELECT 1 FROM books WHERE {downloader.name} = ?", (source_id,))
+        if cursor.fetchone():
+            log.info("Skipping %s (already in database)", source_id)
+            continue
+
+        log.info("Progress %s/%s", idx, total)
+        downloader.book = (source_id, book_title, author, category)
+        store_in_db(downloader, connection, cursor)
+        time.sleep(1)
+
+def init_database(db_path):
+    """Initialize the database schema."""
+    connection = sqlite3.connect(db_path)
+    cursor = connection.cursor()
+    cursor.executescript("""
+    CREATE TABLE IF NOT EXISTS books (
+      id            INTEGER PRIMARY KEY,
+      gutenberg_id  INTEGER UNIQUE,
+      ia_title_id   TEXT UNIQUE,
+      gb_title_id   TEXT UNIQUE,
+      author        TEXT,
+      title         TEXT,
+      category      TEXT,
+      source_url    TEXT,
+      content       TEXT
+    );
+    
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_gutenberg
+    ON books(gutenberg_id)
+    WHERE gutenberg_id IS NOT NULL;
+    
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_archive
+    ON books(ia_title_id)
+    WHERE ia_title_id IS NOT NULL;
+    
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_google
+    ON books(gb_title_id)
+    WHERE gb_title_id IS NOT NULL;
+    """)
+    connection.commit()
+    return connection, cursor
+
+
+def main():
+    """Main entry point for the book downloader."""
+    global api_key
+    
+    check_dependencies()
+    
+    ap = argparse.ArgumentParser(
+        description="Download books from various sources into SQLite database."
+    )
+    ap.add_argument("--db", default=DB_PATH_DEFAULT, 
+                    help="Path to SQLite database (default: library.db)")
+    ap.add_argument("--api-key", default=None, 
+                    help="Optional Google Books API key")
+    args = ap.parse_args()
+    
+    api_key = args.api_key
+    
+    connection, cursor = init_database(args.db)
+    
     try:
-        r = requests.get(url, params=params, timeout=20, headers=headers) 
-        print(f"GB API status {r.status_code} for {gb_id}")
-        if r.status_code != 200:
-            return None, None
-    except requests.RequestException as e:
-        print(f"GB API request error for {gb_id}: {e}")
-        return None, None
+        data = json.loads(sys.stdin.read())
+        
+        process_input(data, connection, cursor)
+    finally:
+        connection.close()
 
-    return extract_gb_pdf(r.json())
 
-def get_gutenberg_id(url: str) -> int | None:
-    if "/ebooks/" not in url:
-        return None
-    return int(url.split("/ebooks/")[1].split("?")[0])
-
-def get_ia_id(url: str) -> str | None:
-    if "/details/" not in url:
-        return None
-    return url.split("/details/")[1].split("/")[0]
-
-def get_google_id(url: str) -> str | None:
-    patterns = [
-        r"/books/edition/[^/]+/([^?\/]+)",   # current format
-        r"\bid=([^&]+)",                     # ?id= format
-        r"/books\?id=([^&]+)",               # old format
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-
-    return None
-
-# Parse arguments
-ap = argparse.ArgumentParser(description="Download books from various sources into SQLite database.")
-ap.add_argument("--db", default=DB_PATH_DEFAULT, help="Path to SQLite database (default: library.db)")
-ap.add_argument("--api-key", default=None, help="Optional Google Books API key")
-args = ap.parse_args()
-
-DB_PATH = args.db
-api_key = args.api_key
-
-connection = sqlite3.connect(DB_PATH)
-cursor = connection.cursor()
-cursor.executescript("""
-CREATE TABLE IF NOT EXISTS books (
-  id            INTEGER PRIMARY KEY,
-  gutenberg_id  INTEGER UNIQUE,
-  ia_title_id   TEXT UNIQUE,
-  gb_title_id   TEXT UNIQUE,
-  author        TEXT,
-  title         TEXT,
-  category      TEXT,
-  source_url    TEXT,
-  content       TEXT
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_gutenberg
-ON books(gutenberg_id)
-WHERE gutenberg_id IS NOT NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_archive
-ON books(ia_title_id)
-WHERE ia_title_id IS NOT NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_google
-ON books(gb_title_id)
-WHERE gb_title_id IS NOT NULL;
-""")
-connection.commit()
-
-data = json.loads(sys.stdin.read())
-
-gutenberg_books = []
-ia_books = []
-gb_books = []
-
-for item in data:
-    lower = {k.lower(): v for k, v in item.items()}
-
-    url = lower.get("url")
-    book_title = lower.get("title")
-    author   = lower.get("author") or "Unknown"
-    category = lower.get("category") or "Uncategorized"
-
-    if not url or not book_title:
-        continue
-
-    if "gutenberg.org" in url:
-        gid = get_gutenberg_id(url)
-        if gid is not None:
-            gutenberg_books.append((gid, book_title, author, category))
-    elif "archive.org" in url:
-        ia_id = get_ia_id(url)
-        if ia_id is not None:
-            ia_books.append((ia_id, book_title, author, category))
-    elif "google.com/books" in url or "www.google.com/books" in url:
-        gb_id = get_google_id(url)
-        if gb_id is not None:
-            gb_books.append((gb_id, book_title, author, category))
-    else:
-        pass
-
-while gutenberg_books:
-    title_id, user_title, author, category = gutenberg_books.pop(0)
-    print(f"Downloading {title_id}...", end="")
-    text, url = download_gutenberg_text(title_id)
-    if text:
-        cursor.execute("""
-            INSERT INTO books (gutenberg_id, author, title, category, source_url, content)
-            VALUES (?,?,?,?,?,?)
-            ON CONFLICT(gutenberg_id) DO UPDATE SET
-              title=excluded.title,
-              category=excluded.category,
-              source_url=excluded.source_url,
-              content=excluded.content,
-              author=excluded.author
-        """, (title_id, author, user_title, category, url, text))
-        connection.commit()
-        print("Pass")
-    else:
-        print("Fail")
-    time.sleep(1)
-
-while ia_books:
-    title_id, user_title, author, category = ia_books.pop(0)
-    print(f"Downloading {title_id}...", end="")
-    safe_id = quote(title_id, safe="")
-    text, url = download_ia_text(safe_id)
-    if text:
-        cursor.execute("""
-            INSERT INTO books (ia_title_id, author, title, category, source_url, content)
-            VALUES (?,?,?,?,?,?)
-            ON CONFLICT(ia_title_id) DO UPDATE SET
-              title=excluded.title,
-              category=excluded.category,
-              source_url=excluded.source_url,
-              content=excluded.content,
-              author=excluded.author
-        """, (title_id, author, user_title, category, url, text))
-        connection.commit()
-        print("Pass")
-    else:
-        print("Fail")
-    time.sleep(1)
-
-while gb_books:
-    title_id, user_title, author, category = gb_books.pop(0)
-    print(f"Downloading {title_id}...", end="")
-    safe_id = quote(title_id, safe="")
-    text, url = download_gb_text(safe_id, api_key=api_key)
-    if text:
-        cursor.execute("""
-            INSERT INTO books (gb_title_id, author, title, category, source_url, content)
-            VALUES (?,?,?,?,?,?)
-            ON CONFLICT(gb_title_id) DO UPDATE SET
-              title=excluded.title,
-              category=excluded.category,
-              source_url=excluded.source_url,
-              content=excluded.content,
-              author=excluded.author
-        """, (title_id, author, user_title, category, url, text))
-        connection.commit()
-        print("Pass")
-    else:
-        print("Fail")
-    time.sleep(1)
+if __name__ == "__main__":
+    main()
     
-connection.close()
-print("Done.")
